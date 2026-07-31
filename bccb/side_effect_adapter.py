@@ -234,16 +234,16 @@ class SideEffect:
             self.adrecs_adr_id_to_adrecs_drug_id = {
                 dr.adr_badd: dr.drug_badd for dr in adrecs.adrecs_drug_adr()
             }
-            self.adrecs_adr_id_to_meddra_id = {
-                entry.badd: str(entry.meddra)
-                for entry in self.adrecs_terminology
-            }
 
         if (
             SideEffectEdgeType.SIDE_EFFECT_HIERARCHICAL_ASSOCIATION
             in self.edge_types
         ):
             self.adrecs_ontology = adrecs.adrecs_hierarchy()
+            self.adrecs_adr_id_to_meddra_id = { 
+                entry.badd: str(entry.meddra)
+                for entry in self.adrecs_terminology
+            }
 
         t1 = time()
         logger.info(
@@ -417,7 +417,15 @@ class SideEffect:
             else:
                 full_path = os.path.join(os.getcwd(), "Drug_to_side_effect.csv")
 
-            merged_df.to_csv(full_path, index=False)
+            export_df = merged_df.copy()
+            export_df["drugbank_id"] = export_df["drugbank_id"].apply(
+                lambda x: self.add_prefix_to_id(prefix="drugbank", identifier=str(x)) if pd.notna(x) else x
+            )
+            export_df["meddra_id"] = export_df["meddra_id"].apply(
+                lambda x: self.add_prefix_to_id(prefix="meddra", identifier=str(x)) if pd.notna(x) else x
+            )
+
+            export_df.to_csv(full_path, index=False)
             logger.info(
                 f"Drug-side effect edge data data is written: {full_path}"
             )
@@ -518,20 +526,20 @@ class SideEffect:
         return node_list
 
     def get_edges(self,
-                drug_side_effect_label: str = "drug_has_side_effect",
-                adrecs_side_effect_hierarchy_label: str = "side_effect_is_a_side_effect") -> list[tuple]:
+            drug_side_effect_label: str = "drug_has_side_effect",
+            adrecs_side_effect_hierarchy_label: str = "side_effect_is_a_side_effect") -> list[tuple]:
 
         logger.info("Started writing ALL edge types")
 
         edge_list = []
 
+        if SideEffectEdgeType.DRUG_TO_SIDE_EFFECT in self.edge_types:
+            edge_list.extend(self.get_drug_side_effect_edges(drug_side_effect_label))
+
         if (
             SideEffectEdgeType.SIDE_EFFECT_HIERARCHICAL_ASSOCIATION
             in self.edge_types
         ):
-            edge_list.extend(self.get_drug_side_effect_edges(drug_side_effect_label))
-
-        if SideEffectEdgeType.DRUG_TO_SIDE_EFFECT in self.edge_types:
             edge_list.extend(self.get_adrecs_side_effect_hierarchical_edges(adrecs_side_effect_hierarchy_label))
 
         return edge_list
