@@ -240,7 +240,7 @@ class SideEffect:
             in self.edge_types
         ):
             self.adrecs_ontology = adrecs.adrecs_hierarchy()
-            self.adrecs_adr_id_to_meddra_id = {          # ← doğru bloğa taşındı
+            self.adrecs_adr_id_to_meddra_id = { 
                 entry.badd: str(entry.meddra)
                 for entry in self.adrecs_terminology
             }
