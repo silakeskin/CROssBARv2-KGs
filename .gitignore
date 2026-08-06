@@ -17,4 +17,6 @@ dist/*
 *.kate-swp
 biocypher-out/
 biocypher-log/
+pypath_log/
 .ipynb-checkpoints/
+deneme*.py
