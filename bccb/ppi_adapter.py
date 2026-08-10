@@ -275,19 +275,10 @@ class PPI:
         t1 = time()
 
         if not self.intact_ints:
-            logger.warning(
-                "IntAct returned no interactions, "
-                "creating an empty dataframe."
+            logger.error(
+                "IntAct returned no interactions."
             )
-            empty_df = pd.DataFrame(
-                columns=list(self.intact_field_new_names.values())
-            )
-            self.check_status_and_properties["intact"]["processed"] = True
-            self.check_status_and_properties["intact"]["dataframe"] = empty_df
-            self.check_status_and_properties["intact"][
-                "properties_dict"
-            ] = self.intact_field_new_names
-            return
+            raise ValueError("IntAct returned no interactions. Please check the IntAct data source")
 
         # create dataframe
         intact_df = pd.DataFrame.from_records(
@@ -481,19 +472,10 @@ class PPI:
         t1 = time()
 
         if not self.biogrid_ints:
-            logger.warning(
-                "BioGRID returned no interactions , "
-                "creating an empty dataframe."
+            logger.error(
+                "BioGRID returned no interactions"
             )
-            empty_df = pd.DataFrame(
-                columns=list(self.biogrid_field_new_names.values())
-            )
-            self.check_status_and_properties["biogrid"]["processed"] = True
-            self.check_status_and_properties["biogrid"]["dataframe"] = empty_df
-            self.check_status_and_properties["biogrid"][
-                "properties_dict"
-            ] = self.biogrid_field_new_names
-            return
+            raise ValueError("BioGRID returned no interactions. Please check the BioGRID data source")
 
         # create dataframe
         biogrid_df = pd.DataFrame.from_records(
@@ -750,18 +732,9 @@ class PPI:
 
         if not self.string_ints:
             logger.warning(
-                "STRING returned no interactions, "
-                "creating an empty dataframe."
+                "STRING returned no interactions"
             )
-            empty_df = pd.DataFrame(
-                columns=list(self.string_field_new_names.values())
-            )
-            self.check_status_and_properties["string"]["processed"] = True
-            self.check_status_and_properties["string"]["dataframe"] = empty_df
-            self.check_status_and_properties["string"][
-                "properties_dict"
-            ] = self.string_field_new_names
-            return
+            raise ValueError("STRING returned no interactions. Please check the STRING data source")
 
         # create dataframe
         string_df = pd.DataFrame.from_records(
@@ -793,11 +766,6 @@ class PPI:
         string_df = string_df[list(self.string_field_new_names.keys())]
         # rename columns
         string_df.rename(columns=self.string_field_new_names, inplace=True)
-
-        # filter with swissprot ids
-        # we already filtered interactions in line 307, we can remove this part or keep it for a double check
-        # string_df = string_df[(string_df["uniprot_a"].isin(self.swissprots)) & (string_df["uniprot_b"].isin(self.swissprots))]
-        # string_df.reset_index(drop=True, inplace=True)
 
         # drop duplicates if same a x b pair exists in b x a format
         # keep the one with the highest combined score
