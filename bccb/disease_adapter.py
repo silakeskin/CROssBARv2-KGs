@@ -23,6 +23,7 @@ import h5py
 from pypath.inputs import ontology
 from pypath.formats import obo
 from pypath.utils import mapping
+from pypath.utils import go as go_util
 from pypath.share import cache
 
 from typing import Union
@@ -95,6 +96,7 @@ class DiseaseNodeField(Enum, metaclass=DiseaseEnumMeta):
 
 class DiseaseEdgeType(Enum, metaclass=DiseaseEnumMeta):
     MONDO_HIERARCHICAL_RELATIONS = auto()
+    MONDO_CROSS_ONTOLOGY_RELATIONS = auto()
     ORGANISM_TO_DISEASE = auto()
     GENE_TO_DISEASE = auto()
     DISEASE_TO_DRUG = auto()
@@ -319,24 +321,408 @@ class Disease:
             f"Mondo data is downloaded in {round((t1-t0) / 60, 2)} mins"
         )
 
-        if DiseaseEdgeType.MONDO_HIERARCHICAL_RELATIONS in self.edge_types:
+        mondo_hierarchy_requested = (
+            DiseaseEdgeType.MONDO_HIERARCHICAL_RELATIONS
+            in self.edge_types
+        )
+
+        mondo_cross_ontology_requested = (
+            DiseaseEdgeType.MONDO_CROSS_ONTOLOGY_RELATIONS
+            in self.edge_types
+        )
+
+        if (
+            mondo_hierarchy_requested
+            or mondo_cross_ontology_requested
+        ):
             t0 = time()
 
-            mondo_obo_reader = obo.Obo(
-                "http://purl.obolibrary.org/obo/mondo.obo"
+            mondo_url = (
+                "https://purl.obolibrary.org/obo/mondo.obo"
             )
 
-            mondo_obo_reader.parent_terms()
+            # =====================================================
+            # is_a RELATIONS
+            # =====================================================
 
-            self.mondo_hierarchical_relations = {
-                k: v for k, v in mondo_obo_reader.parents.items() if v
-            }
+            hierarchy_reader = obo.Obo(mondo_url)
+
+            hierarchy_reader.parent_terms()
+
+            self.mondo_hierarchical_relations = {}
+
+            cross_ontology_relations = []
+
+            for child, parent_ids in (
+                hierarchy_reader.parents.items()
+            ):
+                if not (
+                    isinstance(child, str)
+                    and child.startswith("MONDO:")
+                ):
+                    continue
+
+                mondo_parents = []
+
+                for parent in parent_ids:
+                    if not isinstance(parent, str):
+                        continue
+
+                    # MONDO -> MONDO hierarchy
+                    if parent.startswith("MONDO:"):
+                        mondo_parents.append(parent)
+
+                    # MONDO -> another ontology
+                    elif (
+                        mondo_cross_ontology_requested
+                        and ":" in parent
+                    ):
+                        cross_ontology_relations.append(
+                            {
+                                "source_id": child,
+                                "relation": "is_a",
+                                "target_id": parent,
+                                "target_ontology": (
+                                    parent.split(":", 1)[0]
+                                ),
+                            }
+                        )
+
+                if (
+                    mondo_hierarchy_requested
+                    and mondo_parents
+                ):
+                    self.mondo_hierarchical_relations[
+                        child
+                    ] = mondo_parents
+
+            # =====================================================
+            # EXPLICIT relationship: RELATIONS
+            # =====================================================
+
+            if mondo_cross_ontology_requested:
+
+                # Separate reader is intentional.
+                relationship_reader = obo.Obo(mondo_url)
+
+                external_term_names = {}
+
+                for term in relationship_reader:
+
+                    if term.stanza != "Term":
+                        continue
+
+                    if not term.id:
+                        continue
+
+                    term_id = term.id.value
+
+                    term_name = None
+
+                    if getattr(term, "name", None):
+                        term_name = getattr(
+                            term.name,
+                            "value",
+                            None,
+                        )
+
+                    if term_name:
+                        external_term_names[
+                            term_id
+                        ] = term_name
+
+                    source_id = term_id
+
+                    if not (
+                        isinstance(source_id, str)
+                        and source_id.startswith("MONDO:")
+                    ):
+                        continue
+
+                    # =====================================================
+                    # EXPLICIT relationship: FIELDS
+                    # =====================================================
+
+                    relationships = term.attrs.get(
+                        "relationship",
+                        set(),
+                    )
+
+                    for relationship in relationships:
+
+                        relation_type = relationship.value
+
+                        # This is metadata, not a biological / ontological
+                        # relationship that should become a KG edge.
+                        if (
+                            relation_type
+                            == "curated_content_resource"
+                        ):
+                            continue
+
+                        if not relationship.modifiers:
+                            continue
+
+                        target_id = (
+                            relationship.modifiers
+                            .strip()
+                            .split()[0]
+                        )
+
+                        if not target_id:
+                            continue
+
+                        # Internal MONDO relationship.
+                        # MONDO -> MONDO hierarchy is already handled
+                        # separately via parent_terms().
+                        if target_id.startswith("MONDO:"):
+                            continue
+
+                        # Ignore URLs and malformed/non-CURIE targets.
+                        if (
+                            target_id.startswith("http://")
+                            or target_id.startswith("https://")
+                            or ":" not in target_id
+                        ):
+                            continue
+
+                        target_ontology = (
+                            target_id.split(":", 1)[0]
+                        )
+
+                        cross_ontology_relations.append(
+                            {
+                                "source_id": source_id,
+                                "relation": relation_type,
+                                "target_id": target_id,
+                                "target_ontology": target_ontology,
+                            }
+                        )
+
+                # ================================================
+                # REMOVE DUPLICATES
+                # ================================================
+
+                unique_relations = {}
+
+                for relation in cross_ontology_relations:
+
+                    key = (
+                        relation["source_id"],
+                        relation["relation"],
+                        relation["target_id"],
+                    )
+
+                    unique_relations[key] = relation
+
+                self.mondo_cross_ontology_relations = list(
+                    unique_relations.values()
+                )
+                target_ids = {
+                    relation["target_id"]
+                    for relation
+                    in self.mondo_cross_ontology_relations
+                }
+
+                self.mondo_external_term_names = {
+                    target_id: external_term_names.get(
+                        target_id
+                    )
+                    for target_id in target_ids
+                }
+
+                ontology_counts = collections.Counter(
+                    relation["target_ontology"]
+                    for relation
+                    in self.mondo_cross_ontology_relations
+                )
+
+                logger.info(
+                    "MONDO contains "
+                    f"{len(self.mondo_cross_ontology_relations)} "
+                    "cross-ontology relations"
+                )
+
+                for ontology_name, count in (
+                    ontology_counts.most_common()
+                ):
+                    logger.info(
+                        f"MONDO -> {ontology_name}: "
+                        f"{count} relations"
+                    )
+
+            # =====================================================
+            # MONDO HIERARCHY LOGGING
+            # =====================================================
+
+            if mondo_hierarchy_requested:
+
+                mondo_hierarchy_edge_count = sum(
+                    len(parent_ids)
+                    for parent_ids
+                    in self.mondo_hierarchical_relations.values()
+                )
+
+                logger.info(
+                    "MONDO hierarchy contains "
+                    f"{len(self.mondo_hierarchical_relations)} "
+                    "child terms and "
+                    f"{mondo_hierarchy_edge_count} "
+                    "direct is_a relations"
+                )
 
             t1 = time()
+
             logger.info(
-                f"Mondo hierarchical relations data is downloaded in {round((t1-t0) / 60, 2)} mins"
+                "MONDO ontology relations are downloaded "
+                f"in {round((t1 - t0) / 60, 2)} mins"
             )
 
+
+    def get_mondo_cross_ontology_relations(
+        self,
+        target_ontology: str | None = None,
+        relation_type: str | None = None,
+    ) -> list[dict]:
+        """
+        Return MONDO relations targeting terms from external
+        ontologies.
+
+        Optionally filter by target ontology and/or relation type.
+        """
+
+        if not hasattr(
+            self,
+            "mondo_cross_ontology_relations",
+        ):
+            if (
+                DiseaseEdgeType.MONDO_CROSS_ONTOLOGY_RELATIONS
+                not in self.edge_types
+            ):
+                raise ValueError(
+                    "MONDO_CROSS_ONTOLOGY_RELATIONS must be "
+                    "included in edge_types."
+                )
+
+            self.download_mondo_data()
+
+        relations = self.mondo_cross_ontology_relations
+
+        if target_ontology is not None:
+            target_ontology = target_ontology.upper()
+
+            relations = [
+                relation
+                for relation in relations
+                if (
+                    relation["target_ontology"].upper()
+                    == target_ontology
+                )
+            ]
+
+        if relation_type is not None:
+            relations = [
+                relation
+                for relation in relations
+                if (
+                    relation["relation"]
+                    == relation_type
+                )
+            ]
+
+        return relations
+
+    @validate_call
+    def get_mondo_external_ontology_nodes(
+        self,
+        label: str = "external ontology term",
+    ) -> list[tuple]:
+        """
+        Generate nodes for MONDO cross-ontology targets which
+        do not already have a dedicated CROssBAR node adapter.
+
+        HP, GO and NCBITaxon are excluded because they already
+        exist as dedicated node types in CROssBAR.
+        """
+
+        if not hasattr(
+            self,
+            "mondo_cross_ontology_relations",
+        ):
+            self.download_mondo_data()
+
+        logger.debug(
+            "Started writing MONDO external ontology nodes"
+        )
+
+        dedicated_ontologies = {
+            "HP",
+            "GO",
+            "NCBITAXON",
+        }
+
+        external_targets = {}
+
+        for relation in (
+            self.mondo_cross_ontology_relations
+        ):
+            ontology = relation[
+                "target_ontology"
+            ]
+
+            if (
+                ontology.upper()
+                in dedicated_ontologies
+            ):
+                continue
+
+            target_id = relation[
+                "target_id"
+            ]
+
+            external_targets[
+                target_id
+            ] = ontology
+
+        node_list = []
+
+        for target_id, ontology in (
+            external_targets.items()
+        ):
+            normalized_id = (
+                normalize_curie(target_id)
+                or target_id
+            )
+
+            props = {
+                "ontology": ontology,
+            }
+
+            term_name = (
+                getattr(
+                    self,
+                    "mondo_external_term_names",
+                    {},
+                ).get(target_id)
+            )
+
+            if term_name:
+                props["name"] = term_name
+
+            node_list.append(
+                (
+                    normalized_id,
+                    label,
+                    props,
+                )
+            )
+
+        logger.info(
+            f"Generated {len(node_list)} "
+            "external ontology term nodes"
+        )
+
+        return node_list
     def download_pathophenodb_data(self) -> None:
         if DiseaseEdgeType.ORGANISM_TO_DISEASE in self.edge_types:
             t0 = time()
@@ -1954,21 +2340,131 @@ class Disease:
 
                 if self.early_stopping and index == self.early_stopping:
                     break
-
+        if (
+            DiseaseEdgeType.MONDO_CROSS_ONTOLOGY_RELATIONS
+            in self.edge_types
+        ):
+            node_list.extend(
+                self.get_mondo_external_ontology_nodes()
+            )            
         # write node data to csv
+        # ============================================================
+        # WRITE NODE DATA TO CSV
+        # ============================================================
+
         if self.export_csv:
-            if self.output_dir:
-                full_path = os.path.join(self.output_dir, "Disease.csv")
-            else:
-                full_path = os.path.join(os.getcwd(), "Disease.csv")
 
-            df_list = [
-                {"disease_id": _id} | props for _id, _, props in node_list
+            output_dir = (
+                self.output_dir
+                if self.output_dir
+                else os.getcwd()
+            )
+
+            # --------------------------------------------------------
+            # DISEASE NODES
+            # --------------------------------------------------------
+
+            disease_records = [
+                {
+                    "disease_id": node_id,
+                    **props,
+                }
+                for (
+                    node_id,
+                    node_label,
+                    props,
+                ) in node_list
+                if node_label == label
             ]
-            df = pd.DataFrame.from_records(df_list)
-            df.to_csv(full_path, index=False)
-            logger.info(f"Disease node data is written: {full_path}")
 
+            if disease_records:
+
+                disease_path = os.path.join(
+                    output_dir,
+                    "Disease.csv",
+                )
+
+                disease_df = (
+                    pd.DataFrame.from_records(
+                        disease_records
+                    )
+                )
+
+                disease_df.to_csv(
+                    disease_path,
+                    index=False,
+                )
+
+                logger.info(
+                    "Disease node data is written: "
+                    f"{disease_path}"
+                )
+
+            # --------------------------------------------------------
+            # EXTERNAL ONTOLOGY TERM NODES
+            # --------------------------------------------------------
+
+            external_records = [
+                {
+                    "external_ontology_term_id":
+                        node_id,
+                    **props,
+                }
+                for (
+                    node_id,
+                    node_label,
+                    props,
+                ) in node_list
+                if (
+                    node_label
+                    == "external ontology term"
+                )
+            ]
+
+            if external_records:
+
+                external_path = os.path.join(
+                    output_dir,
+                    "External_ontology_term.csv",
+                )
+
+                external_df = (
+                    pd.DataFrame.from_records(
+                        external_records
+                    )
+                )
+
+                external_df.to_csv(
+                    external_path,
+                    index=False,
+                )
+
+                logger.info(
+                    "External ontology term node "
+                    f"data is written: {external_path}"
+                )
+
+            # --------------------------------------------------------
+            # DEFENSIVE CHECK
+            # --------------------------------------------------------
+
+            expected_labels = {
+                label,
+                "external ontology term",
+            }
+
+            unexpected_labels = {
+                node_label
+                for _, node_label, _ in node_list
+                if node_label not in expected_labels
+            }
+
+            if unexpected_labels:
+                logger.warning(
+                    "Unexpected node labels during "
+                    "Disease adapter CSV export: "
+                    f"{sorted(unexpected_labels)}"
+                )
         return node_list
 
     @validate_call
@@ -1996,6 +2492,8 @@ class Disease:
 
         if DiseaseEdgeType.MONDO_HIERARCHICAL_RELATIONS in self.edge_types:
             edge_list.extend(self.get_mondo_hiererchical_edges(mondo_hierarchy_label))
+        if ( DiseaseEdgeType.MONDO_CROSS_ONTOLOGY_RELATIONS in self.edge_types ):
+            edge_list.extend(self.get_mondo_cross_ontology_edges())
 
         if DiseaseEdgeType.ORGANISM_TO_DISEASE in self.edge_types:
             edge_list.extend(self.get_organism_disease_edges(organism_to_disease_label))
@@ -2049,6 +2547,340 @@ class Disease:
             logger.info(f"Mondo hiererchical edge data is written: {full_path}")
 
         return edge_list
+    
+    @validate_call
+    def get_mondo_cross_ontology_edges(
+        self,
+        target_ontologies: list[str] | None = None,
+        phenotype_label: str = (
+            "disease_has_mondo_relation_to_phenotype"
+        ),
+        organism_label: str = (
+            "disease_has_mondo_relation_to_organism"
+        ),
+        biological_process_label: str = (
+            "disease_has_mondo_relation_to_biological_process"
+        ),
+        cellular_component_label: str = (
+            "disease_has_mondo_relation_to_cellular_component"
+        ),
+        molecular_function_label: str = (
+            "disease_has_mondo_relation_to_molecular_function"
+        ),
+        external_ontology_label: str = (
+            "disease_has_mondo_relation_to_external_ontology_term"
+        ),
+    ) -> list[tuple]:
+
+        if not hasattr(
+            self,
+            "mondo_cross_ontology_relations",
+        ):
+            self.download_mondo_data()
+
+        logger.debug(
+            "Started writing MONDO cross-ontology edges"
+        )
+
+        # =========================================================
+        # OPTIONAL FILTER
+        #
+        # None means: include ALL target ontologies.
+        # =========================================================
+
+        if target_ontologies is None:
+            requested_ontologies = None
+        else:
+            requested_ontologies = {
+                ontology.upper()
+                for ontology in target_ontologies
+            }
+
+        # =========================================================
+        # LOAD GO ONLY WHEN NEEDED
+        # =========================================================
+
+        go_requested = (
+            requested_ontologies is None
+            or "GO" in requested_ontologies
+        )
+
+        if (
+            go_requested
+            and not hasattr(
+                self,
+                "mondo_go_ontology",
+            )
+        ):
+            logger.info(
+                "Loading Gene Ontology for "
+                "MONDO GO target typing"
+            )
+
+            self.mondo_go_ontology = (
+                go_util.GeneOntology()
+            )
+
+        go_aspect_to_label = {
+            "P": biological_process_label,
+            "C": cellular_component_label,
+            "F": molecular_function_label,
+        }
+
+        edge_list = []
+
+        unknown_go_aspects = []
+        invalid_relations = []
+
+        # =========================================================
+        # GENERATE EDGES
+        # =========================================================
+
+        for relation in tqdm(
+            self.mondo_cross_ontology_relations
+        ):
+
+            source_raw = relation.get(
+                "source_id"
+            )
+
+            target_raw = relation.get(
+                "target_id"
+            )
+
+            target_ontology = relation.get(
+                "target_ontology"
+            )
+
+            mondo_relation = relation.get(
+                "relation"
+            )
+
+            # -----------------------------------------------------
+            # Basic validation
+            # -----------------------------------------------------
+
+            if not (
+                isinstance(source_raw, str)
+                and isinstance(target_raw, str)
+                and isinstance(target_ontology, str)
+                and isinstance(mondo_relation, str)
+            ):
+                invalid_relations.append(
+                    relation
+                )
+                continue
+
+            ontology_key = (
+                target_ontology.upper()
+            )
+
+            # -----------------------------------------------------
+            # Apply filter ONLY when a filter was requested
+            # -----------------------------------------------------
+
+            if (
+                requested_ontologies is not None
+                and ontology_key
+                not in requested_ontologies
+            ):
+                continue
+
+            source_id = (
+                normalize_curie(source_raw)
+                or source_raw
+            )
+
+            target_id = (
+                normalize_curie(target_raw)
+                or target_raw
+            )
+
+            # =====================================================
+            # HP
+            # =====================================================
+
+            if ontology_key == "HP":
+
+                label = phenotype_label
+
+            # =====================================================
+            # NCBITaxon
+            # =====================================================
+
+            elif ontology_key == "NCBITAXON":
+
+                label = organism_label
+
+            # =====================================================
+            # GO
+            # =====================================================
+
+            elif ontology_key == "GO":
+
+                go_aspect = (
+                    self.mondo_go_ontology
+                    .aspect
+                    .get(target_raw)
+                )
+
+                if go_aspect is None:
+
+                    go_aspect = (
+                        self.mondo_go_ontology
+                        .aspect
+                        .get(
+                            target_raw.removeprefix(
+                                "GO:"
+                            )
+                        )
+                    )
+
+                label = (
+                    go_aspect_to_label.get(
+                        go_aspect
+                    )
+                )
+
+                if label is None:
+
+                    unknown_go_aspects.append(
+                        {
+                            "source_id": source_raw,
+                            "target_id": target_raw,
+                            "relation": mondo_relation,
+                        }
+                    )
+
+                    continue
+
+            # =====================================================
+            # EVERYTHING ELSE
+            #
+            # UBERON
+            # CHR
+            # CL
+            # PATO
+            # CHEBI
+            # ECTO
+            # SO
+            # NCIT
+            # ENVO
+            # ...
+            # =====================================================
+
+            else:
+
+                label = external_ontology_label
+
+            # =====================================================
+            # PROPERTIES
+            # =====================================================
+
+            props = {
+                "source": "MONDO",
+                "mondo_relation": mondo_relation,
+                "target_ontology": target_ontology,
+            }
+
+            edge_list.append(
+                (
+                    None,
+                    source_id,
+                    target_id,
+                    label,
+                    props,
+                )
+            )
+
+            if (
+                self.early_stopping
+                and len(edge_list)
+                >= self.early_stopping
+            ):
+                break
+
+        # =========================================================
+        # LOGGING
+        # =========================================================
+
+        logger.info(
+            f"Generated {len(edge_list)} "
+            "MONDO cross-ontology edges"
+        )
+
+        if invalid_relations:
+
+            logger.warning(
+                f"{len(invalid_relations)} invalid "
+                "MONDO cross-ontology records "
+                "were skipped"
+            )
+
+        if unknown_go_aspects:
+
+            logger.warning(
+                f"{len(unknown_go_aspects)} GO targets "
+                "could not be assigned to a GO aspect"
+            )
+
+            for relation in (
+                unknown_go_aspects[:10]
+            ):
+                logger.warning(
+                    f"Unknown GO target: {relation}"
+                )
+
+        # =========================================================
+        # CSV EXPORT
+        # =========================================================
+
+        if self.export_csv:
+
+            if self.output_dir:
+                full_path = os.path.join(
+                    self.output_dir,
+                    "Mondo_cross_ontology_edges.csv",
+                )
+            else:
+                full_path = os.path.join(
+                    os.getcwd(),
+                    "Mondo_cross_ontology_edges.csv",
+                )
+
+            df_list = [
+                {
+                    "source_id": source,
+                    "target_id": target,
+                    "label": label,
+                    **props,
+                }
+                for (
+                    _,
+                    source,
+                    target,
+                    label,
+                    props,
+                ) in edge_list
+            ]
+
+            df = pd.DataFrame.from_records(
+                df_list
+            )
+
+            df.to_csv(
+                full_path,
+                index=False,
+            )
+
+            logger.info(
+                "MONDO cross-ontology edge data "
+                f"is written: {full_path}"
+            )
+
+        return edge_list
+
+    
 
     @validate_call
     def get_organism_disease_edges(
@@ -2263,16 +3095,44 @@ class Disease:
 
     @validate_call
     def add_prefix_to_id(
-        self, prefix: str = None, identifier: str = None, sep: str = ":"
-    ) -> str:
+        self,
+        prefix: str | None = None,
+        identifier: str | None = None,
+        sep: str = ":",
+    ) -> str | None:
         """
-        Adds prefix to database id
+        Add a prefix to an identifier when needed.
+
+        If the identifier is already a CURIE, it is normalized
+        without adding the prefix again.
         """
-        if self.add_prefix and identifier:
-            return normalize_curie(prefix + sep + identifier)
 
-        return identifier
+        if not identifier:
+            return identifier
 
+        if not self.add_prefix:
+            return identifier
+
+        identifier = str(identifier)
+
+        # Identifier already has a prefix.
+        if ":" in identifier:
+            return (
+                normalize_curie(identifier)
+                or identifier
+            )
+
+        if not prefix:
+            return identifier
+
+        curie = (
+            f"{prefix}{sep}{identifier}"
+        )
+
+        return (
+            normalize_curie(curie)
+            or curie
+        )
     def merge_source_column(self, element, joiner="|"):
 
         _list = []
