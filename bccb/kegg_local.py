@@ -14,9 +14,53 @@ from collections.abc import Iterable
 import pypath.resources.urls as urls
 from pypath.share import curl
 
+import asyncio
+import aiohttp
+import warnings
+import random
+
+from dataclasses import dataclass
+from typing import Optional
+import json
+
+
+
+
+DEFAULT_TIMEOUT = aiohttp.ClientTimeout(total=30)
+DDI_BATCH_SIZE = 500
+
 _url = urls.urls['kegg_api']['url']
 
+class AsyncRateLimiter:
+    """
+    Ensures that requests are started no faster than the configured rate.
+    """
+
+    def __init__(self, requests_per_second: float = 2.0):
+        if requests_per_second <= 0:
+            raise ValueError(
+                "requests_per_second must be greater than zero."
+            )
+
+        self.minimum_interval = 1.0 / requests_per_second
+        self._lock = asyncio.Lock()
+        self._last_request_time = 0.0
+
+    async def wait(self) -> None:
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            current_time = loop.time()
+
+            elapsed = current_time - self._last_request_time
+            remaining = self.minimum_interval - elapsed
+
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+
+            self._last_request_time = loop.time()
+
 def gene_to_pathway(org):
+
 
     return _kegg_from_source_to_target('gene', 'pathway', org)
 
@@ -103,9 +147,6 @@ def drug_to_drug(
     drug = _Drug()
     compound = _Compound()
 
-    if asynchronous:
-        warnings.warn('Async is not implemented for now. Defaulting to False...')
-        asynchronous = False
     
     if drugs != None:
 
@@ -113,8 +154,7 @@ def drug_to_drug(
 
     else:
         drugIds = drug.get_data().keys()
-        # Async will be false until it gets implemented properly
-        entries = _kegg_ddi(drugIds, join=False, asynchronous=False)
+        entries = _kegg_ddi(drugIds, join=False, asynchronous=asynchronous)
 
     interactions = dict()
 
@@ -320,28 +360,155 @@ def _kegg_general(operation, *arguments, split=True):
         return []
 
 
-async def _kegg_general_async(operation, *arguments):
 
-    #TODO Yet to be implemented
-    # This function doesn't work but it better
-    # stay so we can implement it without
-    # changing the structure of the module
+async def _fetch_with_retry(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: AsyncRateLimiter,
+    operation: str,
+    identifier: str,
+    retries: int = 3,
+):
 
-    return None
 
     url = _url % operation
+    url += f"/{identifier}"
 
-    for argument in arguments:
+    last_exception = None
 
-        url += f'/{argument}'
+    for attempt in range(1, retries + 1):
 
-    c = await curl.Curl(url, silent = True, large = False)
+        try:
 
-    try:
-        return [line.split('\t') if split else line for line in c.result.split('\n') if line]
-    except AttributeError:
-        return []
+            await rate_limiter.wait()
 
+            async with semaphore:
+
+                async with session.get(url) as response:
+
+                    status = response.status
+
+                    response.raise_for_status()
+
+                    text = await response.text()
+
+                    return RequestResult(
+                        identifier=identifier,
+                        endpoint=operation,
+                        success=True,
+                        retries=attempt,
+                        status_code=status,
+                        error=None,
+                        data=[
+                            line.split("\t")
+                            for line in text.splitlines()
+                            if line
+                        ],
+                    )
+
+        except aiohttp.ClientResponseError as e:
+
+            last_exception = e
+
+            # 404 -> DDI kaydı yok, retry yapma
+            if e.status == 404:
+
+                return RequestResult(
+                    identifier=identifier,
+                    endpoint=operation,
+                    success=False,
+                    retries=attempt,
+                    status_code=e.status,
+                    error=str(e),
+                    data=[],
+                )
+
+            # 403 -> Rate limit olabilir, daha uzun bekle
+            if e.status == 403:
+
+                if attempt < retries:
+
+                    retry_after = e.headers.get("Retry-After")
+
+                    if retry_after is not None:
+
+                        wait = float(retry_after)
+
+                    else:
+
+                        wait = (5 * attempt) + random.uniform(0, 2)
+
+                    print(
+                        f"[403] {identifier} "
+                        f"(attempt {attempt}/{retries}) "
+                        f"retrying in {wait:.1f}s"
+                    )
+
+                    await asyncio.sleep(wait)
+
+                    continue
+
+            # Diğer HTTP hataları (500, 502, vb.)
+            if attempt < retries:
+
+                wait = (2 ** (attempt - 1)) + random.uniform(0, 1)
+
+                print(
+                    f"[HTTP {e.status}] {identifier} "
+                    f"(attempt {attempt}/{retries}) "
+                    f"retrying in {wait:.1f}s"
+                )
+
+                await asyncio.sleep(wait)
+
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+        ) as e:
+
+            last_exception = e
+
+            if attempt < retries:
+                await asyncio.sleep((2 ** (attempt - 1)) + random.random())
+
+    status = (
+        getattr(last_exception, "status", None)
+        if last_exception
+        else None
+    )
+
+    return RequestResult(
+        identifier=identifier,
+        endpoint=operation,
+        success=False,
+        retries=retries,
+        status_code=status,
+        error=repr(last_exception),
+        data=[],
+    )
+
+async def _kegg_general_async(
+    session: aiohttp.ClientSession,
+    semaphore: asyncio.Semaphore,
+    rate_limiter: AsyncRateLimiter,
+    operation: str,
+    *arguments,
+):
+
+
+    if len(arguments) != 1:
+
+        raise ValueError(
+            "_kegg_general_async currently supports a single identifier."
+        )
+
+    return await _fetch_with_retry(
+        session=session,
+        semaphore=semaphore,
+        rate_limiter=rate_limiter,
+        operation=operation,
+        identifier=arguments[0],
+    )
 
 def _kegg_list(database, option=None, org=None):
 
@@ -407,15 +574,11 @@ def _kegg_link(source_db, target_db):
 def _kegg_ddi(drugIds, join=True, asynchronous=False):
 
     if join and not isinstance(drugIds, str):
-
         drugIds = ['+'.join(drugIds)]
 
     if asynchronous:
+        return asyncio.run(_kegg_ddi_async(drugIds))
 
-        pool = ThreadPoolExecutor()
-
-        return pool.submit(asyncio.run, _kegg_ddi_async(drugIds)).result()
-        
     return _kegg_ddi_sync(drugIds)
 
 
@@ -432,23 +595,184 @@ def _kegg_ddi_sync(drugIds):
         return result
 
 
-async def _kegg_ddi_async(drugIds):
+async def _kegg_ddi_async(
+    drugIds,
+    batch_size=25,
+    concurrency=2,
+    requests_per_second=2.0,
+):
+    result = []
 
-    #TODO Yet to be implemented
-    # This function doesn't work but it better
-    # stay so we can implement it without
-    # changing the structure of the module
+    stats = {
+        "success_first_try": 0,
+        "success_after_retry": 0,
+        "not_found": 0,
+        "failed": 0,
+    }
 
-    result = list()
+    status_counter = {}
+    failures = []
 
-    if isinstance(drugIds, Iterable):
+    timeout = aiohttp.ClientTimeout(total=30)
 
-        for response in asyncio.as_completed([_kegg_general_async('ddi', drugId) for drugId in drugIds]):
-            response = await response
-            result.extend(response)
+    semaphore = asyncio.Semaphore(concurrency)
 
-        return result
+    rate_limiter = AsyncRateLimiter(
+        requests_per_second=requests_per_second
+    )
 
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+
+        for batch_start in range(
+            0,
+            len(drugIds),
+            batch_size,
+        ):
+            batch = drugIds[
+                batch_start:
+                batch_start + batch_size
+            ]
+
+            tasks = [
+                _kegg_general_async(
+                    session,
+                    semaphore,
+                    rate_limiter,
+                    "ddi",
+                    drug_id,
+                )
+                for drug_id in batch
+            ]
+
+            batch_results = await asyncio.gather(
+                *tasks,
+                return_exceptions=True,
+            )
+
+            for request in batch_results:
+
+                if isinstance(request, Exception):
+                    warnings.warn(
+                        f"DDI request failed: {request}"
+                    )
+
+                    stats["failed"] += 1
+
+                    status_counter["EXCEPTION"] = (
+                        status_counter.get("EXCEPTION", 0) + 1
+                    )
+
+                    failures.append({
+                        "drug_id": None,
+                        "status_code": None,
+                        "retries": None,
+                        "error": repr(request),
+                    })
+
+                    continue
+
+                print(
+                    f"{request.identifier:8} | "
+                    f"status={request.status_code} | "
+                    f"success={request.success} | "
+                    f"retries={request.retries}"
+                )
+
+                status_label = (
+                    str(request.status_code)
+                    if request.status_code is not None
+                    else "NO_STATUS"
+                )
+
+                status_counter[status_label] = (
+                    status_counter.get(status_label, 0) + 1
+                )
+
+                if request.success:
+                    if request.retries == 1:
+                        stats["success_first_try"] += 1
+                    else:
+                        stats["success_after_retry"] += 1
+
+                    if request.data:
+                        result.extend(request.data)
+
+                    continue
+
+
+                if request.status_code == 404:
+                    stats["not_found"] += 1
+                    continue
+
+                stats["failed"] += 1
+
+                failures.append({
+                    "drug_id": request.identifier,
+                    "status_code": request.status_code,
+                    "retries": request.retries,
+                    "error": request.error,
+                })
+
+            processed = min(
+                batch_start + len(batch),
+                len(drugIds),
+            )
+
+            print(
+                f"Processed {processed}/{len(drugIds)} drugs "
+                f"({processed / len(drugIds) * 100:.1f}%)"
+            )
+
+    with open(
+        "ddi_failures.json",
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            failures,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    print("\n========== DDI DOWNLOAD SUMMARY ==========")
+
+    print(
+        f"Succeeded on first try : "
+        f"{stats['success_first_try']}"
+    )
+
+    print(
+        f"Succeeded after retry  : "
+        f"{stats['success_after_retry']}"
+    )
+
+    print(
+        f"No DDI record (404)     : "
+        f"{stats['not_found']}"
+    )
+
+    print(
+        f"Failed permanently     : "
+        f"{stats['failed']}"
+    )
+
+    print(
+        "Failure log            : "
+        "ddi_failures.json"
+    )
+
+    print("\nStatus code summary")
+
+    for status, count in sorted(status_counter.items()):
+        print(f"{status}: {count}")
+
+    print(
+        f"\nReturned interaction rows: "
+        f"{len(result)}"
+    )
+
+    return result
 
 def _kegg_from_source_to_target(source_db, target_db, org=None) -> tuple:
 
@@ -690,9 +1014,20 @@ class _Organism(_KeggDatabase):
 
 
     def download_data(self):
-        entries = _kegg_list('organism')
-        self._data = {self.handle(org) : [org_id, org_name] for (org_id, org, org_name, _) in entries}
+        entries = _kegg_list("genome")
 
+        data = {}
+
+        for genome_id, description in entries:
+            # description = "hsa; Homo sapiens (human)"
+            org, org_name = description.split(";", 1)
+
+            data[self.handle(org.strip())] = [
+                genome_id,
+                org_name.strip(),
+            ]
+
+        self._data = data
 
     def handle(self, org):
         return org
@@ -782,23 +1117,15 @@ class _Compound(_SplitDatabase):
 
 class _ConversionTable:
 
-    _table = dict()
-
     def __init__(self):
-        self.download_table()
-
+        self._table = {}
 
     @abstractmethod
     def download_table(self):
         pass
 
-
     def get(self, index):
-        try:
-            return self._table[index]
-        except KeyError:
-            return None
-
+        return self._table.get(index)
 
     def get_table(self):
         return self._table
@@ -807,7 +1134,9 @@ class _ConversionTable:
 class _OrgTable(_ConversionTable):
 
     def __init__(self, org=None):
-        if org != None:
+        super().__init__()
+
+        if org is not None:
             self.download_table(org)
 
 
@@ -851,3 +1180,13 @@ class _ChebiToKegg(_ConversionTable):
     def download_table(self):
         table = _kegg_conv('chebi', 'drug', source_split=True, target_split=True)
         self._table = table
+
+@dataclass
+class RequestResult:
+    identifier: str
+    endpoint: str
+    success: bool
+    retries: int
+    status_code: Optional[int]
+    error: Optional[str]
+    data: list
