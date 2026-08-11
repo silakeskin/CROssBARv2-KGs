@@ -177,6 +177,15 @@ ec number:
     name: str
     rxnfp_embedding: float[]
 
+external ontology term:
+  is_a: named thing
+  represented_as: node
+  preferred_id: id
+  label_in_input: external ontology term
+  properties:
+    name: str
+    ontology: str
+
 # Cell: # relevant?
   # represented_as: node
   # preferred_id: CL
@@ -219,6 +228,18 @@ protein to organism taxon association:
   target: organismTaxon
   label_in_input: Protein_belongs_to_organism
   
+disease to external ontology term mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_external_ontology_term
+  source: disease
+  target: external ontology term
+  label_in_input: disease_has_mondo_relation_to_external_ontology_term
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
+
 post translational interaction:
   is_a: pairwise molecular interaction
   represented_as: edge
@@ -474,6 +495,69 @@ gene to disease association:
     variation_id: str
     pubmed_ids: str[]
     dbsnp_id: str[]
+disease to phenotype mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_phenotype
+  source: disease
+  target: phenotype
+  label_in_input: disease_has_mondo_relation_to_phenotype
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
+
+
+disease to organism taxon mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_organism
+  source: disease
+  target: organism taxon
+  label_in_input: disease_has_mondo_relation_to_organism
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
+
+
+disease to biological process mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_biological_process
+  source: disease
+  target: biological process
+  label_in_input: disease_has_mondo_relation_to_biological_process
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
+
+
+disease to cellular component mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_cellular_component
+  source: disease
+  target: cellular component
+  label_in_input: disease_has_mondo_relation_to_cellular_component
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
+
+
+disease to molecular function mondo association:
+  is_a: association
+  represented_as: edge
+  label_as_edge: disease_has_mondo_relation_to_molecular_function
+  source: disease
+  target: molecular function
+  label_in_input: disease_has_mondo_relation_to_molecular_function
+  properties:
+    source: str
+    mondo_relation: str
+    target_ontology: str
 
 protein to phenotype association:
   is_a: GeneToPhenotypicFeatureAssociation
